@@ -3,6 +3,7 @@ import requests
 import sqlite3
 import private.config as config
 
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageChops, ImageFont
 from imgurpython import ImgurClient
 
@@ -10,64 +11,96 @@ class InstaBot:
     def __init__(self):
         self.connection = sqlite3.connect('private/data.db')
         self.cursor = self.connection.cursor()
-        self.font = ImageFont.truetype("public/courier_prime.ttf", 120)
-        self.template = Image.open('public/template.png')
+        self.font = ImageFont.truetype("private/courier_prime.ttf", 120)
+        self.template = Image.open('private/template.png')
         self.dim, _ = self.template.size
         self.wrapper = textwrap.TextWrapper(width=13)
         self.client = ImgurClient(config.client_id, config.client_secret)
+        self.caption_template = Path('private/caption_template.txt').read_text().replace('#', '%23')
+        self.access_token = Path('private/access_token.txt').read_text()
 
+
+    # Generate Img from Template.png using DB contents
     def generate_images(self):
-        self.cursor.execute("SELECT * FROM posts")
-        rows = self.cursor.fetchall()
+        self.cursor.execute("SELECT * FROM posts WHERE status = 0")
+        row = self.cursor.fetchone()
+        if row is None:
+            exit("Database empty")
+        i_id = row[0]
+        msg = row[1]
+        caption = row[2]
+        wrapped_msg = ""
+        paragraph = self.wrapper.wrap(msg)
 
-        for i, row in enumerate(rows):
-            print(row)
-            if row[3] == 0:
-                msg = row[1]
-                wrapped_msg = ""
-                paragraph = self.wrapper.wrap(msg)
+        for ii in paragraph[:-1]:
+            wrapped_msg = wrapped_msg + ii + '\n'
+        wrapped_msg += paragraph[-1]
 
-                for ii in paragraph[:-1]:
-                    wrapped_msg = wrapped_msg + ii + '\n'
-                wrapped_msg += paragraph[-1]
+        img = ImageChops.duplicate(self.template)
 
-                img = ImageChops.duplicate(self.template)
+        draw = ImageDraw.Draw(img)
+        w, h = draw.textsize(wrapped_msg, font=self.font)
 
-                draw = ImageDraw.Draw(img)
-                w, h = draw.textsize(wrapped_msg, font=self.font)
+        draw.text(((self.dim-w)/2,(self.dim-h)/2), wrapped_msg, font=self.font, fill='white', align='center')
+        img.save(f"img/{i_id}.png", "PNG")
+        return i_id, caption
 
-                draw.text(((self.dim-w)/2,(self.dim-h)/2), wrapped_msg, font=self.font, fill='white', align='center')
-                img.save(f"img/{i}.png", "PNG")
 
-    def upload_image(self, i):
-        return self.client.upload_from_path(f"img/{i}.png")['link']
+    # Upload img to Imgur and return link
+    def upload_imgur(self, i):
+        res = self.client.upload_from_path(f"img/{i}.png")
+        print(res)
+        return res['link']
 
-    def post_image(self, url):
-        r = requests.get(f"https://graph.facebook.com/v11.0/{config.uid}?fields=instagram_business_account&access_token={config.access_token}")
-        if r.status_code != 200:
-            print(r.json())
-            return
-        
-        ig_id = r.json()['instagram_business_account']['id']
-        r1 = requests.post(f"https://graph.facebook.com/v11.0/{ig_id}/media?image_url={url}&caption=Test&access_token={config.access_token}")
 
+    # Renew FB Access Token (60 Day Expiry)
+    def renew_token(self):
+        r_at = requests.get(f"https://graph.facebook.com/v11.0/oauth/access_token?grant_type=fb_exchange_token&client_id={config.fb_id}&client_secret={config.fb_secret}&fb_exchange_token={self.access_token}")
+        if r_at.status_code == 200:
+            f = open('private/access_token.txt', 'w')
+            f.write(r_at.json()['access_token'])
+            f.close()
+
+
+    # Upload image to Facebook via Imgur Link & Add Caption
+    def upload_img(self, i, ig_id, url, caption):
+        r1 = requests.post(f"https://graph.facebook.com/v11.0/{ig_id}/media?image_url={url}&caption={caption}\n\n{self.caption_template}&access_token={self.access_token}")
         if r1.status_code != 200:
-            print(r1.json())
-            return
+            exit(r1.json())
 
-        creation_id = r1.json()['id']
+        return r1.json()['id']
 
-        r2 = requests.post(f"https://graph.facebook.com/v11.0/{ig_id}/media_publish?creation_id={creation_id}&access_token={config.access_token}")
+
+    # Publish Post 
+    def post_publish(self, ig_id, creation_id):
+        r2 = requests.post(f"https://graph.facebook.com/v11.0/{ig_id}/media_publish?creation_id={creation_id}&access_token={self.access_token}")
 
         if r2.status_code != 200:
-            print(r2.json())
+            exit(r2.json())
 
+    
+    # Set status of row in DB to 1 to indicate that it has been posted!
+    def update_status(self, i):
+        update_query = f"UPDATE posts SET status = 1 WHERE id = {i}"
+        self.cursor.execute(update_query)
+        self.connection.commit()
+
+
+    # GRAPH API CALLS
+    def post_image(self, url, i, caption):
+        self.renew_token()
+        post_id = self.upload_img(i, config.ig_id, url, caption)
+        self.post_publish(config.ig_id, post_id)
+        self.update_status(i)
         print("Done")
-        return
+    
 
+    # Run whole procedure
     def run(self):
-        self.generate_images()
-        self.post_image(self.upload_image())
+        img_id, caption = self.generate_images()
+        #link = self.upload_imgur(img_id)
+        #self.post_image(link, img_id, caption)
+        print("Done")
 
 if __name__ == '__main__':
     bot = InstaBot()
